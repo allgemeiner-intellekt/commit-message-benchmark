@@ -40,12 +40,11 @@ def dataset_show(limit: int = 10):
 
 @app.command("run")
 def cmd_run(
-    free_only: bool = typer.Option(False, "--free-only"),
     models: Optional[list[str]] = typer.Option(None, "--models", "-m"),
     commits: Optional[int] = typer.Option(None, "--commits", "-n"),
 ):
     """Generate commit messages for (commit × model) cells, skipping cached ones."""
-    summary = run(free_only=free_only, only_models=models, limit_commits=commits)
+    summary = run(only_models=models, limit_commits=commits)
     typer.echo(json.dumps(summary, indent=2))
 
 
@@ -119,10 +118,10 @@ def cmd_install_hook(
 
 
 @app.command("models")
-def cmd_models(free_only: bool = typer.Option(False, "--free-only")):
+def cmd_models():
     """List configured candidate models."""
-    for m in load_models(free_only=free_only):
-        typer.echo(f"{m['tier']:5}  {m['slug']}")
+    for m in load_models():
+        typer.echo(m["slug"])
 
 
 if __name__ == "__main__":

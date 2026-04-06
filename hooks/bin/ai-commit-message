@@ -562,8 +562,10 @@ build_api_payload() {
     local user_file="$2"
     local payload_file="$3"
 
-    python3 - "$system_file" "$user_file" "$payload_file" "$AI_MODEL" "$MAX_TOKENS" <<'PYEOF'
+    python3 - "$system_file" "$user_file" "$payload_file" "$AI_MODEL" "$MAX_TOKENS" \
+        "${AI_COMMIT_REASONING_EFFORT:-}" <<'PYEOF'
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -572,6 +574,7 @@ user_file = Path(sys.argv[2])
 payload_file = Path(sys.argv[3])
 model = sys.argv[4]
 max_tokens = int(sys.argv[5])
+reasoning_effort = (sys.argv[6] if len(sys.argv) > 6 else "").strip().lower()
 
 payload = {
     "model": model,
@@ -583,6 +586,12 @@ payload = {
     "max_tokens": max_tokens,
     "stream": False,
 }
+
+# OpenRouter `reasoning` parameter — providers that don't support it ignore it.
+# A commit-message hook does not need extended reasoning; effort=low keeps
+# latency and cost sane on gpt-5-mini / gpt-5-nano / o-series and friends.
+if reasoning_effort and reasoning_effort != "off":
+    payload["reasoning"] = {"effort": reasoning_effort, "exclude": True}
 
 payload_file.write_text(json.dumps(payload), encoding="utf-8")
 PYEOF
@@ -687,28 +696,31 @@ call_ai_api() {
 
     if [ -n "$USAGE_SIDECAR" ]; then
         response_chars="$(wc -c <"$body_file" | tr -d '[:space:]')"
-        openrouter_id="$(python3 - "$body_file" <<'PYEOF'
-import json, sys
-try:
-    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
-    print(data.get("id") or "")
-except Exception:
-    print("")
-PYEOF
-)"
         python3 - "$USAGE_SIDECAR" "$stage_label" "$AI_MODEL" "$http_code" \
-            "$latency_ms" "$openrouter_id" "$request_chars" "$response_chars" <<'PYEOF'
+            "$latency_ms" "$request_chars" "$response_chars" "$body_file" <<'PYEOF'
 import json, sys
-path, stage, model, status, latency, oid, req_chars, resp_chars = sys.argv[1:9]
+path, stage, model, status, latency, req_chars, resp_chars, body_path = sys.argv[1:9]
 entry = {
     "stage": stage,
     "model": model,
     "http_status": int(status),
     "latency_ms": int(latency),
-    "openrouter_id": oid,
     "request_chars": int(req_chars),
     "response_chars": int(resp_chars),
+    "openrouter_id": "",
+    "cost_usd": 0.0,
+    "tokens_prompt": 0,
+    "tokens_completion": 0,
 }
+try:
+    data = json.load(open(body_path, "r", encoding="utf-8"))
+    entry["openrouter_id"] = data.get("id") or ""
+    usage = data.get("usage") or {}
+    entry["cost_usd"] = float(usage.get("cost") or 0.0)
+    entry["tokens_prompt"] = int(usage.get("prompt_tokens") or 0)
+    entry["tokens_completion"] = int(usage.get("completion_tokens") or 0)
+except Exception:
+    pass
 with open(path, "a", encoding="utf-8") as fh:
     fh.write(json.dumps(entry) + "\n")
 PYEOF

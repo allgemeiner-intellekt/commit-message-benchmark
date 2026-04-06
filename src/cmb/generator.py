@@ -78,6 +78,15 @@ def generate(
             "AI_COMMIT_MODEL": model,
             "AI_COMMIT_USAGE_SIDECAR": str(sidecar),
             "AI_COMMIT_DEBUG": env.get("AI_COMMIT_DEBUG", "false"),
+            # Reasoning models (gpt-5-mini, gpt-5-nano, o-series) burn the
+            # default 500-token budget on reasoning_tokens. We bump to 2000 AND
+            # tell OpenRouter to keep reasoning effort low and exclude the
+            # reasoning trace from the response — non-reasoning providers
+            # ignore the parameter, so it's safe to set globally.
+            "AI_COMMIT_MAX_TOKENS": env.get("AI_COMMIT_MAX_TOKENS", "2000"),
+            "AI_COMMIT_REASONING_EFFORT": env.get("AI_COMMIT_REASONING_EFFORT", "low"),
+            # Some reasoning models still take >60s end-to-end on a real diff.
+            "AI_COMMIT_TIMEOUT_SECONDS": env.get("AI_COMMIT_TIMEOUT_SECONDS", "180"),
         }
     )
     if extra_env:
@@ -111,19 +120,10 @@ def generate(
         except FileNotFoundError:
             pass
 
-    # Look up per-call cost from OpenRouter.
-    total_cost = 0.0
-    for call in stage_calls:
-        gid = call.get("openrouter_id")
-        if not gid:
-            continue
-        info = fetch_generation(gid)
-        if info is None:
-            continue
-        call["openrouter_cost"] = info.get("total_cost")
-        call["tokens_prompt"] = info.get("tokens_prompt")
-        call["tokens_completion"] = info.get("tokens_completion")
-        total_cost += float(info.get("total_cost") or 0.0)
+    # Cost comes straight from the chat-completions response usage block,
+    # captured into the sidecar by the hook. The legacy /generation lookup
+    # endpoint always 404s now, so we no longer rely on it.
+    total_cost = sum(float(c.get("cost_usd") or 0.0) for c in stage_calls)
 
     result = GenerationResult(
         commit_id=commit_id,

@@ -19,14 +19,9 @@ from .generator import GenerationResult, generate, load_cached
 from .replay import replay
 
 
-def load_models(free_only: bool = False, only: list[str] | None = None) -> list[dict]:
+def load_models(only: list[str] | None = None) -> list[dict]:
     cfg = yaml.safe_load(paths.MODELS_YAML.read_text(encoding="utf-8"))
-    models: list[dict] = []
-    for entry in cfg.get("free", []) or []:
-        models.append({**entry, "tier": "free"})
-    if not free_only:
-        for entry in cfg.get("paid", []) or []:
-            models.append({**entry, "tier": "paid"})
+    models: list[dict] = list(cfg.get("models", []) or [])
     if only:
         wanted = set(only)
         models = [m for m in models if m["slug"] in wanted]
@@ -39,7 +34,6 @@ def _provider(slug: str) -> str:
 
 def run(
     *,
-    free_only: bool = False,
     only_models: list[str] | None = None,
     limit_commits: int | None = None,
 ) -> dict:
@@ -50,7 +44,7 @@ def run(
     if not commits:
         raise RuntimeError("no commits in data/commits.jsonl — run `bench dataset build` first")
 
-    models = load_models(free_only=free_only, only=only_models)
+    models = load_models(only=only_models)
     if not models:
         raise RuntimeError("no models selected (check config/models.yaml)")
 

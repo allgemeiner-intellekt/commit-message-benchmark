@@ -144,14 +144,21 @@ def judgement_path(cell: CellId) -> Path:
     return paths.JUDGEMENTS_DIR / f"{cell.slug}.json"
 
 
-def write_queue(batch_size: int = 5) -> dict[str, Any]:
-    """Create prompt files + manifest.json for every ungraded cell."""
+def write_queue(batch_size: int = 10) -> dict[str, Any]:
+    """Create prompt files + manifest.json for every ungraded cell.
+
+    Batches are aligned on commit boundaries: every cell for one commit goes
+    into the same batch (so a subagent grading commit X never collides with
+    another subagent also grading commit X). `batch_size` is interpreted as
+    a target number of *commits* per batch, not cells.
+    """
     paths.ensure_dirs()
     rubric = load_rubric()
     rubric_version = str(rubric.get("version", "1.0.0"))
     hook_version = paths.hook_version()
 
     queued: list[dict[str, Any]] = []
+    by_commit: dict[str, list[str]] = {}
     for cell, gen, commit in all_cells(rubric_version, hook_version):
         if judgement_path(cell).exists():
             continue
@@ -170,10 +177,18 @@ def write_queue(batch_size: int = 5) -> dict[str, Any]:
                 "judgement_path": str(judgement_path(cell).relative_to(paths.ROOT)),
             }
         )
+        by_commit.setdefault(cell.commit_id, []).append(cell.slug)
 
+    # Bucket commits into batches; cells from the same commit always travel together.
+    commit_ids = sorted(by_commit.keys())
     batches: list[list[str]] = []
-    for i in range(0, len(queued), batch_size):
-        batches.append([entry["cell_id"] for entry in queued[i : i + batch_size]])
+    for i in range(0, len(commit_ids), batch_size):
+        chunk = commit_ids[i : i + batch_size]
+        batch: list[str] = []
+        for cid in chunk:
+            batch.extend(by_commit[cid])
+        if batch:
+            batches.append(batch)
 
     manifest = {
         "rubric_version": rubric_version,
