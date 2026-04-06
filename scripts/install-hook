@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Convenience wrapper around `bench install-hook`. Copies the vendored hook
+# back to ~/.git-hooks/. Pass the chosen model slug as the first argument.
+set -euo pipefail
+MODEL="${1:-}"
+if [ -z "$MODEL" ]; then
+    echo "usage: $0 <openrouter-model-slug>" >&2
+    exit 1
+fi
+cd "$(dirname "$0")/.."
+exec uv run bench install-hook --model "$MODEL"

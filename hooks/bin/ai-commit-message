@@ -1,0 +1,1043 @@
+#!/bin/bash
+
+# =============================================================================
+# AI Commit Message Generator
+# =============================================================================
+# Reads staged Git changes and generates a commit message using an
+# OpenAI-compatible API (DeepSeek by default).
+#
+# Strategy:
+#   1. Build a structured summary of the staged changes.
+#   2. Add budgeted patch excerpts, distributed across important files.
+#   3. Generate a draft commit message in one call.
+#   4. Escalate to a second focused call only for complex / noisy diffs.
+#
+# Supported environment variables:
+#   AI_COMMIT_API_KEY                 required for AI generation
+#   AI_COMMIT_API_URL                 default: https://api.deepseek.com/v1/chat/completions
+#   AI_COMMIT_MODEL                   default: deepseek-chat
+#   AI_COMMIT_MAX_CONTEXT             default: 24000
+#   AI_COMMIT_MAX_DIFF                legacy alias for AI_COMMIT_MAX_CONTEXT
+#   AI_COMMIT_SECOND_STAGE_MAX_CONTEXT default: 32000
+#   AI_COMMIT_STAGE2_FILE_LIMIT       default: 5
+#   AI_COMMIT_LANGUAGE                default: English
+#   AI_COMMIT_MAX_TOKENS              default: 500
+#   AI_COMMIT_TIMEOUT_SECONDS         default: 60
+#   AI_COMMIT_DEBUG                   default: false
+#   AI_COMMIT_USAGE_SIDECAR           if set, append a JSON line per API call
+#                                     to this path with stage/model/latency/id
+# =============================================================================
+
+AI_API_URL="${AI_COMMIT_API_URL:-https://api.deepseek.com/v1/chat/completions}"
+AI_MODEL="${AI_COMMIT_MODEL:-deepseek-chat}"
+AI_API_KEY="${AI_COMMIT_API_KEY:-}"
+MAX_CONTEXT_CHARS="${AI_COMMIT_MAX_CONTEXT:-${AI_COMMIT_MAX_DIFF:-24000}}"
+SECOND_STAGE_MAX_CONTEXT_CHARS="${AI_COMMIT_SECOND_STAGE_MAX_CONTEXT:-32000}"
+STAGE2_FILE_LIMIT="${AI_COMMIT_STAGE2_FILE_LIMIT:-5}"
+LANGUAGE="${AI_COMMIT_LANGUAGE:-English}"
+MAX_TOKENS="${AI_COMMIT_MAX_TOKENS:-500}"
+TIMEOUT_SECONDS="${AI_COMMIT_TIMEOUT_SECONDS:-60}"
+DEBUG="${AI_COMMIT_DEBUG:-false}"
+USAGE_SIDECAR="${AI_COMMIT_USAGE_SIDECAR:-}"
+
+debug_log() {
+    if [ "$DEBUG" = "true" ]; then
+        echo "[ai-commit debug] $1" >&2
+    fi
+}
+
+info_log() {
+    echo "[ai-commit] $1" >&2
+}
+
+warn_log() {
+    echo "[ai-commit] WARNING: $1" >&2
+}
+
+has_required_commands() {
+    local missing=0
+
+    if ! command -v git >/dev/null 2>&1; then
+        warn_log "'git' is not available"
+        missing=1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        warn_log "'curl' is not available"
+        missing=1
+    fi
+
+    if ! command -v python3 >/dev/null 2>&1; then
+        warn_log "'python3' is not available"
+        missing=1
+    fi
+
+    return "$missing"
+}
+
+collect_git_context() {
+    local tmpdir="$1"
+
+    if ! git diff --cached --name-status --no-renames >"$tmpdir/name_status.txt"; then
+        return 1
+    fi
+
+    if ! git diff --cached --numstat --no-renames >"$tmpdir/numstat.txt"; then
+        return 1
+    fi
+
+    if ! git diff --cached --stat --no-renames >"$tmpdir/diff_stat.txt"; then
+        return 1
+    fi
+
+    if ! git diff --cached --diff-algorithm=minimal --no-ext-diff --no-color -U1 >"$tmpdir/diff_u1.txt"; then
+        return 1
+    fi
+
+    if ! git diff --cached --diff-algorithm=minimal --no-ext-diff --no-color -U0 >"$tmpdir/diff_u0.txt"; then
+        return 1
+    fi
+}
+
+build_context() {
+    local tmpdir="$1"
+    local mode="$2"
+    local max_chars="$3"
+    local focus_file="$4"
+    local context_file="$5"
+    local meta_file="$6"
+
+    python3 - "$tmpdir" "$mode" "$max_chars" "$focus_file" "$STAGE2_FILE_LIMIT" "$context_file" "$meta_file" <<'PYEOF'
+import json
+import math
+import os
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+
+
+tmpdir = Path(sys.argv[1])
+mode = sys.argv[2]
+max_chars = int(sys.argv[3])
+focus_file = Path(sys.argv[4])
+stage2_file_limit = int(sys.argv[5])
+context_file = Path(sys.argv[6])
+meta_file = Path(sys.argv[7])
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return ""
+
+
+name_status_text = read_text(tmpdir / "name_status.txt")
+numstat_text = read_text(tmpdir / "numstat.txt")
+diff_stat_text = read_text(tmpdir / "diff_stat.txt")
+diff_u1_text = read_text(tmpdir / "diff_u1.txt")
+diff_u0_text = read_text(tmpdir / "diff_u0.txt")
+
+focus_paths = []
+if focus_file.exists():
+    for line in read_text(focus_file).splitlines():
+        line = line.strip()
+        if line:
+            focus_paths.append(line)
+
+
+def categorize(path: str) -> str:
+    lower = path.lower()
+    base = os.path.basename(lower)
+
+    lock_names = {
+        "package-lock.json",
+        "pnpm-lock.yaml",
+        "yarn.lock",
+        "cargo.lock",
+        "composer.lock",
+        "poetry.lock",
+        "gemfile.lock",
+        "pipfile.lock",
+    }
+    if base in lock_names or lower.endswith(".lock"):
+        return "lock"
+    if "/__snapshots__/" in lower or lower.endswith(".snap"):
+        return "snapshot"
+    if (
+        "/dist/" in lower
+        or "/build/" in lower
+        or "/coverage/" in lower
+        or "/generated/" in lower
+        or "/gen/" in lower
+        or lower.endswith(".min.js")
+        or lower.endswith(".map")
+    ):
+        return "generated"
+    if (
+        lower.startswith("docs/")
+        or "/docs/" in lower
+        or base in {"readme.md", "changelog.md", "license", "license.md"}
+        or lower.endswith(".md")
+        or lower.endswith(".rst")
+        or lower.endswith(".adoc")
+        or lower.endswith(".txt")
+    ):
+        return "docs"
+    if (
+        "/test/" in lower
+        or "/tests/" in lower
+        or "/spec/" in lower
+        or "/__tests__/" in lower
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+        or base.endswith(".spec.ts")
+        or base.endswith(".spec.tsx")
+        or base.endswith(".spec.js")
+        or base.endswith(".test.ts")
+        or base.endswith(".test.tsx")
+        or base.endswith(".test.js")
+        or lower.endswith(".feature")
+    ):
+        return "test"
+    if (
+        base in {
+            "package.json",
+            "tsconfig.json",
+            "dockerfile",
+            ".gitignore",
+            ".gitattributes",
+            "makefile",
+        }
+        or lower.endswith(".json")
+        or lower.endswith(".yaml")
+        or lower.endswith(".yml")
+        or lower.endswith(".toml")
+        or lower.endswith(".ini")
+        or lower.endswith(".cfg")
+        or lower.endswith(".conf")
+    ):
+        return "config"
+    return "source"
+
+
+def parse_sections(text: str) -> dict[str, str]:
+    sections: dict[str, str] = {}
+    current_path = None
+    current_lines: list[str] = []
+    diff_pattern = re.compile(r'^diff --git "?a/(.+?)"? "?b/(.+?)"?$')
+
+    for line in text.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            if current_path is not None:
+                sections[current_path] = "".join(current_lines)
+            current_lines = [line]
+            match = diff_pattern.match(line.rstrip("\n"))
+            if match:
+                current_path = match.group(2)
+            else:
+                current_path = None
+        elif current_path is not None:
+            current_lines.append(line)
+
+    if current_path is not None:
+        sections[current_path] = "".join(current_lines)
+
+    return sections
+
+
+def split_patch(section: str) -> tuple[str, list[str]]:
+    header: list[str] = []
+    hunks: list[str] = []
+    current_hunk: list[str] | None = None
+
+    for line in section.splitlines(keepends=True):
+        if line.startswith("@@"):
+            if current_hunk is not None:
+                hunks.append("".join(current_hunk))
+            current_hunk = [line]
+        elif current_hunk is None:
+            header.append(line)
+        else:
+            current_hunk.append(line)
+
+    if current_hunk is not None:
+        hunks.append("".join(current_hunk))
+
+    return "".join(header), hunks
+
+
+def trim_text(text: str, budget: int, suffix: str = "\n... [truncated]\n") -> tuple[str, bool]:
+    if len(text) <= budget:
+        return text, False
+    if budget <= len(suffix):
+        return text[:budget], True
+    return text[: budget - len(suffix)] + suffix, True
+
+
+def sample_section(section_u1: str, section_u0: str, budget: int) -> tuple[str, bool]:
+    candidate = section_u1 or section_u0
+    if section_u0 and len(section_u0) < len(candidate):
+        candidate = section_u0
+
+    if len(candidate) <= budget:
+        return candidate, False
+
+    header, hunks = split_patch(candidate)
+    if not hunks:
+        return trim_text(candidate, budget)
+
+    if len(header) >= budget:
+        return trim_text(header, budget)
+
+    # Prefer the first hunk, then the last one if there is room.
+    selected: list[str] = []
+    selected_indexes: list[int] = [0]
+    if len(hunks) > 1:
+        selected_indexes.append(len(hunks) - 1)
+
+    result = header
+    remaining = budget - len(result)
+
+    for index in selected_indexes:
+        hunk = hunks[index]
+        if len(hunk) <= remaining:
+            selected.append(hunk)
+            remaining -= len(hunk)
+        elif not selected:
+            clipped, _ = trim_text(hunk, remaining, "\n... [hunk truncated]\n")
+            selected.append(clipped)
+            remaining = 0
+        if remaining < 120:
+            break
+
+    if len(hunks) > 2 and remaining >= 120:
+        middle_marker = "\n... [additional hunks omitted]\n"
+        if len(middle_marker) <= remaining:
+            selected.insert(1, middle_marker)
+
+    result += "".join(selected)
+    if len(result) > budget:
+        result, _ = trim_text(result, budget)
+    return result, True
+
+
+files: dict[str, dict] = {}
+ordered_paths: list[str] = []
+
+for line in name_status_text.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t", 1)
+    status = parts[0].strip()
+    path = parts[1] if len(parts) > 1 else status[1:].strip()
+    if path not in files:
+        files[path] = {}
+        ordered_paths.append(path)
+    files[path]["status"] = status
+
+for line in numstat_text.splitlines():
+    if not line.strip():
+        continue
+    parts = line.split("\t")
+    if len(parts) < 3:
+        continue
+    added_raw, deleted_raw = parts[0], parts[1]
+    path = "\t".join(parts[2:])
+    if path not in files:
+        files[path] = {}
+        ordered_paths.append(path)
+    binary = added_raw == "-" or deleted_raw == "-"
+    additions = 0 if binary else int(added_raw)
+    deletions = 0 if binary else int(deleted_raw)
+    files[path]["binary"] = binary
+    files[path]["additions"] = additions
+    files[path]["deletions"] = deletions
+
+sections_u1 = parse_sections(diff_u1_text)
+sections_u0 = parse_sections(diff_u0_text)
+
+for path in ordered_paths:
+    info = files[path]
+    info.setdefault("status", "M")
+    info.setdefault("binary", False)
+    info.setdefault("additions", 0)
+    info.setdefault("deletions", 0)
+    info["category"] = categorize(path)
+    info["section_u1"] = sections_u1.get(path, "")
+    info["section_u0"] = sections_u0.get(path, "")
+
+category_counts = Counter(info["category"] for info in files.values())
+total_additions = sum(info["additions"] for info in files.values())
+total_deletions = sum(info["deletions"] for info in files.values())
+total_files = len(ordered_paths)
+doc_only = total_files > 0 and all(files[path]["category"] in {"docs"} for path in ordered_paths)
+config_only = total_files > 0 and all(files[path]["category"] in {"config"} for path in ordered_paths)
+
+
+def score_file(path: str, info: dict) -> int:
+    base_scores = {
+        "source": 100,
+        "config": 80,
+        "test": 70,
+        "docs": 45,
+        "generated": 18,
+        "snapshot": 15,
+        "lock": 10,
+    }
+    score = base_scores.get(info["category"], 40)
+
+    if doc_only and info["category"] == "docs":
+        score += 50
+    if config_only and info["category"] == "config":
+        score += 35
+
+    if info["status"].startswith("D"):
+        score += 12
+    if info["status"].startswith("A"):
+        score += 8
+
+    if info["binary"]:
+        score -= 8
+
+    changed_lines = info["additions"] + info["deletions"]
+    score += min(25, int(math.log1p(changed_lines) * 7))
+
+    if path.startswith(("src/", "app/", "lib/", "server/", "api/")):
+        score += 8
+    return score
+
+
+for path in ordered_paths:
+    files[path]["score"] = score_file(path, files[path])
+
+sorted_paths = sorted(
+    ordered_paths,
+    key=lambda path: (
+        files[path]["score"],
+        files[path]["additions"] + files[path]["deletions"],
+        path,
+    ),
+    reverse=True,
+)
+
+low_signal_categories = {"lock", "generated", "snapshot"}
+low_signal_count = sum(1 for path in ordered_paths if files[path]["category"] in low_signal_categories)
+high_priority_count = sum(1 for path in ordered_paths if files[path]["category"] in {"source", "config", "test"})
+raw_diff_chars = len(diff_u1_text)
+recommended_two_stage = (
+    total_files > 12
+    or raw_diff_chars > max_chars * 2
+    or (high_priority_count >= 6 and total_files >= 8)
+    or (low_signal_count * 2 >= total_files and total_files >= 6)
+)
+
+
+def build_file_inventory(paths: list[str], max_items: int | None = None) -> list[str]:
+    lines = []
+    selected = paths if max_items is None else paths[:max_items]
+    for path in selected:
+        info = files[path]
+        delta = "binary" if info["binary"] else f"+{info['additions']}/-{info['deletions']}"
+        lines.append(
+            f"- {info['status']} {path} [{info['category']}] ({delta})"
+        )
+    if max_items is not None and len(paths) > max_items:
+        lines.append(f"- ... {len(paths) - max_items} more files")
+    return lines
+
+
+summary_lines = [
+    "=== STAGED CHANGE SUMMARY ===",
+    f"- files changed: {total_files}",
+    f"- total additions: {total_additions}",
+    f"- total deletions: {total_deletions}",
+    f"- category mix: {', '.join(f'{name} {count}' for name, count in sorted(category_counts.items()))}",
+    f"- raw patch chars (-U1): {raw_diff_chars}",
+]
+if low_signal_count:
+    summary_lines.append(f"- low-signal files: {low_signal_count}")
+summary_lines.append("")
+summary_lines.append("=== CHANGED FILES ===")
+summary_lines.extend(build_file_inventory(ordered_paths, max_items=80))
+summary_lines.append("")
+summary_lines.append("=== DIFF STAT ===")
+summary_lines.append(diff_stat_text.strip() or "(no diff stat available)")
+
+summary_text = "\n".join(summary_lines).strip() + "\n"
+
+if mode == "stage2":
+    selected_paths: list[str] = []
+    seen = set()
+    for path in focus_paths:
+        if path in files and path not in seen:
+            selected_paths.append(path)
+            seen.add(path)
+        if len(selected_paths) >= stage2_file_limit:
+            break
+    for path in sorted_paths:
+        if path not in seen:
+            selected_paths.append(path)
+            seen.add(path)
+        if len(selected_paths) >= stage2_file_limit:
+            break
+    per_file_floor = 900
+    per_file_cap = 5200
+else:
+    selected_paths = []
+    per_file_floor = 550
+    per_file_cap = 2800
+
+if mode != "stage2":
+    patch_budget = max(4000, max_chars - len(summary_text) - 1400)
+    max_patch_files = max(1, min(len(sorted_paths), patch_budget // per_file_floor))
+    selected_paths = sorted_paths[:max_patch_files]
+else:
+    patch_budget = max(6000, max_chars - len(summary_text) - 1800)
+
+if selected_paths:
+    total_score = sum(max(files[path]["score"], 1) for path in selected_paths)
+    remaining = patch_budget
+    allocations: dict[str, int] = {}
+    for index, path in enumerate(selected_paths):
+        paths_left = len(selected_paths) - index
+        min_reserved = per_file_floor * (paths_left - 1)
+        weighted = int(patch_budget * (files[path]["score"] / total_score))
+        allocation = max(per_file_floor, min(per_file_cap, weighted))
+        if allocation > remaining - min_reserved:
+            allocation = max(per_file_floor, remaining - min_reserved)
+        allocations[path] = allocation
+        remaining -= allocation
+    if remaining > 0:
+        for path in selected_paths:
+            if remaining <= 0:
+                break
+            extra = min(remaining, per_file_cap - allocations[path])
+            allocations[path] += extra
+            remaining -= extra
+else:
+    allocations = {}
+
+patch_blocks: list[str] = []
+truncated_patch_paths: list[str] = []
+
+for path in selected_paths:
+    info = files[path]
+    prefix = (
+        f"--- FILE: {path} | status={info['status']} | category={info['category']} | "
+        f"+{info['additions']}/-{info['deletions']} ---\n"
+    )
+    budget = max(200, allocations.get(path, per_file_floor) - len(prefix))
+    sampled_patch, truncated = sample_section(info["section_u1"], info["section_u0"], budget)
+    if truncated:
+        truncated_patch_paths.append(path)
+    patch_blocks.append(prefix + sampled_patch.rstrip() + "\n")
+
+patch_text = "=== PATCH EXCERPTS ===\n" + ("\n".join(patch_blocks).strip() if patch_blocks else "(no patch excerpts selected)")
+
+context_text = (summary_text + "\n" + patch_text).strip() + "\n"
+if len(context_text) > max_chars:
+    context_text, _ = trim_text(context_text, max_chars, "\n... [context truncated to budget]\n")
+
+default_focus_files = sorted_paths[: min(stage2_file_limit, len(sorted_paths))]
+meta = {
+    "recommended_two_stage": recommended_two_stage,
+    "default_focus_files": default_focus_files,
+    "selected_patch_files": selected_paths,
+    "truncated_patch_files": truncated_patch_paths,
+    "total_files": total_files,
+    "raw_patch_chars": raw_diff_chars,
+    "low_signal_count": low_signal_count,
+    "high_priority_count": high_priority_count,
+}
+
+context_file.write_text(context_text, encoding="utf-8")
+meta_file.write_text(json.dumps(meta), encoding="utf-8")
+PYEOF
+}
+
+build_api_payload() {
+    local system_file="$1"
+    local user_file="$2"
+    local payload_file="$3"
+
+    python3 - "$system_file" "$user_file" "$payload_file" "$AI_MODEL" "$MAX_TOKENS" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+system_file = Path(sys.argv[1])
+user_file = Path(sys.argv[2])
+payload_file = Path(sys.argv[3])
+model = sys.argv[4]
+max_tokens = int(sys.argv[5])
+
+payload = {
+    "model": model,
+    "messages": [
+        {"role": "system", "content": system_file.read_text(encoding="utf-8")},
+        {"role": "user", "content": user_file.read_text(encoding="utf-8")},
+    ],
+    "temperature": 0.2,
+    "max_tokens": max_tokens,
+    "stream": False,
+}
+
+payload_file.write_text(json.dumps(payload), encoding="utf-8")
+PYEOF
+}
+
+extract_content_from_response() {
+    local response_file="$1"
+
+    python3 - "$response_file" <<'PYEOF'
+import json
+import re
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+choices = data.get("choices") or []
+message = ""
+if choices:
+    message = ((choices[0].get("message") or {}).get("content") or "").strip()
+
+message = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", message)
+message = re.sub(r"\n?```$", "", message)
+message = message.strip()
+
+if message:
+    print(message)
+PYEOF
+}
+
+call_ai_api() {
+    local system_file="$1"
+    local user_file="$2"
+    local output_file="$3"
+    local stage_label="${4:-unknown}"
+    local payload_file response_file body_file response http_code curl_exit
+    local start_ns end_ns latency_ms request_chars response_chars openrouter_id
+
+    payload_file="$(mktemp)"
+    response_file="$(mktemp)"
+    body_file="$(mktemp)"
+
+    if [ -z "$payload_file" ] || [ -z "$response_file" ] || [ -z "$body_file" ]; then
+        warn_log "Failed to create temp files for the AI request"
+        rm -f "$payload_file" "$response_file" "$body_file"
+        return 1
+    fi
+
+    if ! build_api_payload "$system_file" "$user_file" "$payload_file"; then
+        warn_log "Failed to build the API payload; leaving the commit message unchanged"
+        rm -f "$payload_file" "$response_file" "$body_file"
+        return 1
+    fi
+
+    info_log "Generating AI commit message with ${AI_MODEL}..."
+
+    start_ns="$(python3 -c 'import time;print(time.time_ns())')"
+    response="$(curl -sS -w '\n%{http_code}' \
+        --max-time "$TIMEOUT_SECONDS" \
+        -H "Content-Type: application/json" \
+        -H "Authorization: Bearer $AI_API_KEY" \
+        ${OPENROUTER_REFERER:+-H "HTTP-Referer: $OPENROUTER_REFERER"} \
+        ${OPENROUTER_TITLE:+-H "X-Title: $OPENROUTER_TITLE"} \
+        -d @"$payload_file" \
+        "$AI_API_URL" 2>&1)"
+    curl_exit=$?
+    end_ns="$(python3 -c 'import time;print(time.time_ns())')"
+    latency_ms=$(( (end_ns - start_ns) / 1000000 ))
+
+    request_chars="$(wc -c <"$payload_file" | tr -d '[:space:]')"
+    rm -f "$payload_file"
+
+    if [ "$curl_exit" -ne 0 ]; then
+        warn_log "Network error while calling the AI API; leaving the commit message unchanged"
+        debug_log "curl output: $response"
+        rm -f "$response_file" "$body_file"
+        return 1
+    fi
+
+    http_code="$(printf '%s\n' "$response" | tail -n 1)"
+    printf '%s\n' "$response" | sed '$d' >"$body_file"
+    debug_log "HTTP status: $http_code"
+
+    if [ "$http_code" != "200" ]; then
+        warn_log "AI API returned HTTP $http_code; leaving the commit message unchanged"
+        debug_log "API response: $(head -c 500 "$body_file")"
+        rm -f "$response_file" "$body_file"
+        return 1
+    fi
+
+    if ! cp "$body_file" "$response_file" 2>/dev/null; then
+        warn_log "Failed to prepare the AI response for parsing; leaving the commit message unchanged"
+        rm -f "$response_file" "$body_file"
+        return 1
+    fi
+
+    if ! extract_content_from_response "$response_file" >"$output_file"; then
+        warn_log "Could not parse a commit message from the AI response; leaving the commit message unchanged"
+        rm -f "$response_file" "$body_file"
+        return 1
+    fi
+
+    if [ -n "$USAGE_SIDECAR" ]; then
+        response_chars="$(wc -c <"$body_file" | tr -d '[:space:]')"
+        openrouter_id="$(python3 - "$body_file" <<'PYEOF'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], "r", encoding="utf-8"))
+    print(data.get("id") or "")
+except Exception:
+    print("")
+PYEOF
+)"
+        python3 - "$USAGE_SIDECAR" "$stage_label" "$AI_MODEL" "$http_code" \
+            "$latency_ms" "$openrouter_id" "$request_chars" "$response_chars" <<'PYEOF'
+import json, sys
+path, stage, model, status, latency, oid, req_chars, resp_chars = sys.argv[1:9]
+entry = {
+    "stage": stage,
+    "model": model,
+    "http_status": int(status),
+    "latency_ms": int(latency),
+    "openrouter_id": oid,
+    "request_chars": int(req_chars),
+    "response_chars": int(resp_chars),
+}
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps(entry) + "\n")
+PYEOF
+    fi
+
+    rm -f "$response_file" "$body_file"
+    return 0
+}
+
+parse_stage1_response() {
+    local content_file="$1"
+    local parsed_file="$2"
+
+    python3 - "$content_file" "$parsed_file" <<'PYEOF'
+import json
+import re
+import sys
+from pathlib import Path
+
+content = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+parsed_path = Path(sys.argv[2])
+
+payload = {
+    "commit_message": "",
+    "confidence": "low",
+    "needs_second_pass": False,
+    "focus_files": [],
+    "reason": "",
+}
+
+text = re.sub(r"^```[a-zA-Z0-9_-]*\n?", "", content)
+text = re.sub(r"\n?```$", "", text).strip()
+
+obj = None
+try:
+    obj = json.loads(text)
+except Exception:
+    match = re.search(r"\{.*\}", text, re.S)
+    if match:
+        try:
+            obj = json.loads(match.group(0))
+        except Exception:
+            obj = None
+
+if isinstance(obj, dict):
+    message = obj.get("commit_message") or obj.get("message") or ""
+    confidence = str(obj.get("confidence") or "low").lower()
+    if confidence not in {"high", "medium", "low"}:
+        confidence = "low"
+    focus_files = obj.get("focus_files") or []
+    if not isinstance(focus_files, list):
+        focus_files = []
+    payload.update(
+        {
+            "commit_message": str(message).strip(),
+            "confidence": confidence,
+            "needs_second_pass": bool(obj.get("needs_second_pass")),
+            "focus_files": [str(item).strip() for item in focus_files if str(item).strip()],
+            "reason": str(obj.get("reason") or "").strip(),
+        }
+    )
+else:
+    payload["commit_message"] = text
+
+parsed_path.write_text(json.dumps(payload), encoding="utf-8")
+PYEOF
+}
+
+build_stage1_system_prompt() {
+    local target_file="$1"
+    cat >"$target_file" <<EOF
+You are an expert Git commit message generator. Analyze the staged changes and produce a single commit message in ${LANGUAGE}.
+
+FORMAT RULES (strictly follow):
+- Use Conventional Commits: <type>(<optional scope>): <summary>
+- Types: feat, fix, refactor, docs, style, test, chore, perf, ci, build, revert
+- Scope: the module, component, or area affected (omit if unclear)
+- Summary line: imperative mood, lowercase after colon, max 72 characters, no trailing period
+- If the change is non-trivial, add ONE blank line then a body explaining WHAT changed and WHY (not HOW). Wrap body lines at 72 characters.
+- If there are multiple logical changes, use bullet points ("- ") in the body
+- If there is a breaking change, add a footer: BREAKING CHANGE: <description>
+
+You will receive:
+1. A structured summary of all staged files
+2. Diff statistics
+3. Budgeted patch excerpts sampled across important files
+
+Return ONLY a JSON object with this exact shape:
+{
+  "commit_message": "<final commit message text>",
+  "confidence": "high|medium|low",
+  "needs_second_pass": true|false,
+  "focus_files": ["path/one", "path/two"],
+  "reason": "<one short sentence>"
+}
+
+Guidance for the JSON fields:
+- "commit_message" must be ready to use as the final Git commit message
+- "confidence" should be high only when the main intent is clear from the provided context
+- "needs_second_pass" should be true when the change looks multi-purpose, noisy, or under-specified
+- "focus_files" should name the few files that need closer inspection if another pass is required
+- "reason" should briefly explain why another pass is or is not needed
+
+Do not use markdown fences. Do not add any commentary outside the JSON object.
+EOF
+}
+
+build_stage2_system_prompt() {
+    local target_file="$1"
+    cat >"$target_file" <<EOF
+You are an expert Git commit message generator. Refine the commit message for the staged changes and produce the final message in ${LANGUAGE}.
+
+FORMAT RULES (strictly follow):
+- Use Conventional Commits: <type>(<optional scope>): <summary>
+- Types: feat, fix, refactor, docs, style, test, chore, perf, ci, build, revert
+- Scope: the module, component, or area affected (omit if unclear)
+- Summary line: imperative mood, lowercase after colon, max 72 characters, no trailing period
+- If the change is non-trivial, add ONE blank line then a body explaining WHAT changed and WHY (not HOW). Wrap body lines at 72 characters.
+- If there are multiple logical changes, use bullet points ("- ") in the body
+- If there is a breaking change, add a footer: BREAKING CHANGE: <description>
+
+You will receive:
+1. The structured staged-change summary
+2. A draft commit message from the first pass
+3. Focused patch excerpts for the most important files
+
+Output ONLY the raw final commit message text. No JSON. No markdown fences. No commentary.
+EOF
+}
+
+should_run_second_stage() {
+    local stage1_meta_file="$1"
+    local stage1_parsed_file="$2"
+
+    python3 - "$stage1_meta_file" "$stage1_parsed_file" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+meta = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+parsed = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+
+confidence = (parsed.get("confidence") or "low").lower()
+needs_second_pass = bool(parsed.get("needs_second_pass"))
+recommended = bool(meta.get("recommended_two_stage"))
+focus_files = parsed.get("focus_files") or []
+
+run_second_stage = (
+    needs_second_pass
+    or confidence == "low"
+    or (recommended and confidence != "high")
+    or (recommended and bool(focus_files))
+)
+
+print("true" if run_second_stage else "false")
+PYEOF
+}
+
+write_focus_file() {
+    local stage1_meta_file="$1"
+    local stage1_parsed_file="$2"
+    local focus_file="$3"
+
+    python3 - "$stage1_meta_file" "$stage1_parsed_file" "$focus_file" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+meta = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+parsed = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
+focus_path = Path(sys.argv[3])
+
+focus_files = parsed.get("focus_files") or []
+if not focus_files:
+    focus_files = meta.get("default_focus_files") or []
+
+focus_path.write_text("\n".join(str(item).strip() for item in focus_files if str(item).strip()) + "\n", encoding="utf-8")
+PYEOF
+}
+
+build_stage2_user_prompt() {
+    local stage1_context_file="$1"
+    local stage2_context_file="$2"
+    local stage1_parsed_file="$3"
+    local stage2_user_file="$4"
+
+    python3 - "$stage1_context_file" "$stage2_context_file" "$stage1_parsed_file" "$stage2_user_file" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+stage1_context = Path(sys.argv[1]).read_text(encoding="utf-8").strip()
+stage2_context = Path(sys.argv[2]).read_text(encoding="utf-8").strip()
+parsed = json.loads(Path(sys.argv[3]).read_text(encoding="utf-8"))
+output = Path(sys.argv[4])
+
+draft = (parsed.get("commit_message") or "").strip()
+reason = (parsed.get("reason") or "").strip()
+focus_files = parsed.get("focus_files") or []
+
+parts = [
+    "=== FIRST PASS DRAFT ===",
+    draft or "(no draft available)",
+]
+if reason:
+    parts.extend(["", "=== FIRST PASS NOTE ===", reason])
+if focus_files:
+    parts.extend(["", "=== FOCUS FILES ===", "\n".join(f"- {item}" for item in focus_files)])
+parts.extend(["", "=== GLOBAL SUMMARY ===", stage1_context, "", "=== FOCUSED PATCH CONTEXT ===", stage2_context, "", "Write the final commit message now."])
+
+output.write_text("\n".join(parts).strip() + "\n", encoding="utf-8")
+PYEOF
+}
+
+generate_ai_message() {
+    local tmpdir stage1_context_file stage1_meta_file stage1_system_file stage1_user_file stage1_response_file
+    local stage1_parsed_file stage2_system_file stage2_focus_file stage2_context_file stage2_meta_file
+    local stage2_user_file stage2_response_file final_message run_second_stage raw_patch_chars
+
+    if [ -z "$AI_API_KEY" ]; then
+        warn_log "AI_COMMIT_API_KEY is not set; leaving the commit message unchanged"
+        return 1
+    fi
+
+    if ! has_required_commands; then
+        warn_log "Required commands are missing; leaving the commit message unchanged"
+        return 1
+    fi
+
+    if git diff --cached --quiet --exit-code; then
+        debug_log "Skipping: no staged diff available"
+        return 1
+    fi
+
+    tmpdir="$(mktemp -d)"
+    if [ -z "$tmpdir" ] || [ ! -d "$tmpdir" ]; then
+        warn_log "Failed to create a temp directory; leaving the commit message unchanged"
+        return 1
+    fi
+
+    stage1_context_file="$tmpdir/stage1_context.txt"
+    stage1_meta_file="$tmpdir/stage1_meta.json"
+    stage1_system_file="$tmpdir/stage1_system.txt"
+    stage1_user_file="$stage1_context_file"
+    stage1_response_file="$tmpdir/stage1_response.txt"
+    stage1_parsed_file="$tmpdir/stage1_parsed.json"
+    stage2_system_file="$tmpdir/stage2_system.txt"
+    stage2_focus_file="$tmpdir/stage2_focus.txt"
+    stage2_context_file="$tmpdir/stage2_context.txt"
+    stage2_meta_file="$tmpdir/stage2_meta.json"
+    stage2_user_file="$tmpdir/stage2_user.txt"
+    stage2_response_file="$tmpdir/stage2_response.txt"
+
+    if ! collect_git_context "$tmpdir"; then
+        warn_log "Failed to collect staged Git context; leaving the commit message unchanged"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    raw_patch_chars="$(wc -c <"$tmpdir/diff_u1.txt" | tr -d '[:space:]')"
+    debug_log "Raw staged patch size (-U1): ${raw_patch_chars:-0} chars"
+
+    if ! build_context "$tmpdir" "stage1" "$MAX_CONTEXT_CHARS" "$stage2_focus_file" "$stage1_context_file" "$stage1_meta_file"; then
+        warn_log "Failed to build the staged change summary; leaving the commit message unchanged"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    build_stage1_system_prompt "$stage1_system_file"
+
+    if ! call_ai_api "$stage1_system_file" "$stage1_user_file" "$stage1_response_file" "stage1"; then
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    if ! parse_stage1_response "$stage1_response_file" "$stage1_parsed_file"; then
+        warn_log "Failed to parse the first AI response; leaving the commit message unchanged"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    final_message="$(python3 - "$stage1_parsed_file" <<'PYEOF'
+import json
+import sys
+from pathlib import Path
+
+parsed = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+print((parsed.get("commit_message") or "").strip())
+PYEOF
+)"
+
+    if [ -z "$final_message" ]; then
+        warn_log "The first AI pass did not return a commit message; leaving the commit message unchanged"
+        rm -rf "$tmpdir"
+        return 1
+    fi
+
+    run_second_stage="$(should_run_second_stage "$stage1_meta_file" "$stage1_parsed_file")"
+    debug_log "Second stage required: $run_second_stage"
+
+    if [ "$run_second_stage" = "true" ]; then
+        write_focus_file "$stage1_meta_file" "$stage1_parsed_file" "$stage2_focus_file"
+
+        if build_context "$tmpdir" "stage2" "$SECOND_STAGE_MAX_CONTEXT_CHARS" "$stage2_focus_file" "$stage2_context_file" "$stage2_meta_file"; then
+            build_stage2_system_prompt "$stage2_system_file"
+            build_stage2_user_prompt "$stage1_context_file" "$stage2_context_file" "$stage1_parsed_file" "$stage2_user_file"
+
+            if call_ai_api "$stage2_system_file" "$stage2_user_file" "$stage2_response_file" "stage2"; then
+                if [ -s "$stage2_response_file" ]; then
+                    final_message="$(cat "$stage2_response_file")"
+                    debug_log "Using second-stage commit message"
+                fi
+            else
+                debug_log "Second-stage request failed; falling back to first-stage message"
+            fi
+        else
+            debug_log "Failed to build second-stage context; falling back to first-stage message"
+        fi
+    fi
+
+    rm -rf "$tmpdir"
+
+    if [ -z "$final_message" ]; then
+        warn_log "Could not generate a commit message; leaving the commit message unchanged"
+        return 1
+    fi
+
+    printf '%s\n' "$final_message"
+    return 0
+}
+
+generate_ai_message

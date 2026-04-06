@@ -101,3 +101,17 @@
 # Logs and temporary outputs
 *.log
 *.tmp
+
+# Project-specific
+.env
+.venv/
+__pycache__/
+*.egg-info/
+data/repos/
+data/replay-cache/
+results/cache/
+results/judge-queue/
+results/judgements/
+results/reviews/
+results/report/
+!results/report/.gitkeep

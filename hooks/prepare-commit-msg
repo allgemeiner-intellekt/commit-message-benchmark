@@ -1,0 +1,124 @@
+#!/bin/bash
+
+# =============================================================================
+# AI Commit Message Hook (prepare-commit-msg)
+# =============================================================================
+# Invokes the standalone AI commit message generator, then lets Git open the
+# editor so the message can be reviewed.
+# =============================================================================
+
+DEBUG="${AI_COMMIT_DEBUG:-false}"
+
+COMMIT_MSG_FILE="$1"
+COMMIT_SOURCE="${2:-}"
+COMMIT_SHA="${3:-}"
+SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+AI_GENERATOR="$SCRIPT_DIR/bin/ai-commit-message"
+
+debug_log() {
+    if [ "$DEBUG" = "true" ]; then
+        echo "[ai-commit debug] $1" >&2
+    fi
+}
+
+info_log() {
+    echo "[ai-commit] $1" >&2
+}
+
+warn_log() {
+    echo "[ai-commit] WARNING: $1" >&2
+}
+
+should_skip_generation() {
+    case "$COMMIT_SOURCE" in
+        message)
+            debug_log "Skipping: user already supplied a message (-m/-F)"
+            return 0
+            ;;
+        merge)
+            debug_log "Skipping: merge commit message"
+            return 0
+            ;;
+        squash)
+            debug_log "Skipping: squash/autosquash commit message"
+            return 0
+            ;;
+        commit)
+            debug_log "Skipping: reusing or amending commit message (${COMMIT_SHA:-no-sha})"
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+get_staged_diff() {
+    git diff --cached --diff-algorithm=minimal --no-ext-diff
+}
+
+comment_context_only() {
+    if [ ! -f "$COMMIT_MSG_FILE" ]; then
+        return 0
+    fi
+
+    awk '
+        /^[[:space:]]*#/ { print; next }
+        /^[[:space:]]*$/ { print; next }
+    ' "$COMMIT_MSG_FILE"
+}
+
+write_commit_message() {
+    local message="$1"
+    local tmp_file context
+
+    tmp_file="$(mktemp)"
+    if [ -z "$tmp_file" ]; then
+        warn_log "Failed to create a temp file for the commit message"
+        return 1
+    fi
+
+    context="$(comment_context_only)"
+
+    {
+        printf '%s\n' "$message"
+        if [ -n "$context" ]; then
+            printf '\n%s\n' "$context"
+        fi
+    } >"$tmp_file"
+
+    mv "$tmp_file" "$COMMIT_MSG_FILE"
+}
+
+if should_skip_generation; then
+    exit 0
+fi
+
+if [ ! -f "$COMMIT_MSG_FILE" ]; then
+    warn_log "Git did not provide a commit message file"
+    exit 0
+fi
+
+if [ ! -x "$AI_GENERATOR" ]; then
+    warn_log "AI generator script is missing or not executable: $AI_GENERATOR"
+    exit 0
+fi
+
+STAGED_DIFF="$(get_staged_diff)"
+if [ -z "$STAGED_DIFF" ]; then
+    debug_log "Skipping: no staged changes detected"
+    exit 0
+fi
+
+MESSAGE="$("$AI_GENERATOR")"
+if [ -z "$MESSAGE" ]; then
+    debug_log "No AI commit message generated; leaving the original message file untouched"
+    exit 0
+fi
+
+if ! write_commit_message "$MESSAGE"; then
+    warn_log "Failed to write the commit message file"
+    exit 1
+fi
+
+info_log "Prepared commit message. Review it in the editor before saving."

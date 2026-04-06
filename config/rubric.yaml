@@ -1,0 +1,53 @@
+version: "1.0.0"
+
+# Each dimension is scored 1-5 by the judge subagent.
+# weights must sum to 1.0; the weighted mean is the headline quality score.
+dimensions:
+  accuracy:
+    weight: 0.30
+    description: |
+      Does the subject line accurately reflect what changed in the diff?
+      Penalize hallucinations, wrong file or component names, and misleading framing.
+  completeness:
+    weight: 0.20
+    description: |
+      Are all material changes covered? No silent omissions of important files
+      or behavior changes. Trivial whitespace and lockfile churn need not be mentioned.
+  conciseness:
+    weight: 0.15
+    description: |
+      No fluff, no restating the obvious, no LLM filler. Subject within the
+      Conventional Commits length guidance, body terse where it exists.
+  format:
+    weight: 0.20
+    description: |
+      Conventional Commits compliance: <type>(<optional scope>): <subject>,
+      lowercase after colon, imperative mood, no trailing period, subject ≤ 72 chars,
+      body wrapped reasonably. The deterministic format_pass boolean is a hard floor.
+  body_quality:
+    weight: 0.15
+    description: |
+      If a body is present, does it explain WHY rather than HOW? For trivial commits
+      no body is fine — score 5 for absence-when-appropriate.
+
+# This text is interpolated into every judge prompt.
+judge_instructions: |
+  You are scoring a single AI-generated git commit message against the diff it is supposed to describe.
+  You are NOT comparing it to the original human message; the original is provided only as
+  one possible reference, not as ground truth — human messages are often poor.
+
+  Score each dimension on an integer 1-5 scale (5 = excellent, 1 = unusable).
+  Then write a single short rationale sentence.
+
+  Output STRICTLY a fenced JSON block of this exact shape (no extra text):
+
+  ```json
+  {
+    "accuracy": 4,
+    "completeness": 5,
+    "conciseness": 4,
+    "format": 5,
+    "body_quality": 4,
+    "rationale": "Captures the refactor accurately and follows Conventional Commits."
+  }
+  ```

@@ -1,0 +1,58 @@
+# Source repos for benchmark commits.
+# Each entry is shallow-cloned to data/repos/<owner>__<repo> at the given ref.
+# `sample_n` caps the per-repo contribution to commits.jsonl after filtering.
+
+seed: 20260406
+target_total: 100
+
+filters:
+  min_files: 1
+  max_files: 30
+  min_patch_chars: 200
+  max_patch_chars: 20000
+  min_message_chars: 10
+  drop_message_patterns:
+    - "^Merge "
+    - "^Revert \""
+    - "^bump version"
+    - "^Bump "
+    - "dependabot"
+
+# Categories to balance the sample across.
+stratify_categories:
+  - feat
+  - fix
+  - refactor
+  - docs
+  - test
+  - chore
+
+repos:
+  - owner: python
+    repo: cpython
+    ref: main
+    sample_n: 18
+  - owner: facebook
+    repo: react
+    ref: main
+    sample_n: 14
+  - owner: kubernetes
+    repo: kubernetes
+    ref: master
+    sample_n: 14
+  - owner: rails
+    repo: rails
+    ref: main
+    sample_n: 14
+  - owner: golang
+    repo: go
+    ref: master
+    sample_n: 14
+  - owner: django
+    repo: django
+    ref: main
+    sample_n: 13
+  - owner: microsoft
+    repo: vscode
+    ref: main
+    sample_n: 13
