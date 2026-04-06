@@ -1,0 +1,103 @@
+.DS_Store
+
+# Archives and compressed bundles
+*.7z
+*.bz2
+*.gz
+*.rar
+*.tar
+*.tgz
+*.xz
+*.zip
+*.zst
+
+# Common datasets and exports
+*.arrow
+*.avro
+*.csv
+*.feather
+*.jsonl
+*.ndjson
+*.orc
+*.parquet
+*.tab
+*.tsv
+
+# Scientific and statistical data
+*.dta
+*.h5
+*.hdf
+*.hdf5
+*.mat
+*.nc
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.rda
+*.rdata
+*.rds
+*.sav
+
+# Local databases and caches
+*.accdb
+*.db
+*.duckdb
+*.mdb
+*.sqlite
+*.sqlite3
+
+# Models and checkpoints
+*.bin
+*.ckpt
+*.gguf
+*.joblib
+*.keras
+*.model
+*.onnx
+*.pb
+*.pt
+*.pth
+*.safetensors
+
+# Bioinformatics and genomics data
+*.bam
+*.bcf
+*.bed
+*.fasta
+*.fastq
+*.fq
+*.gff
+*.gtf
+*.sam
+*.vcf
+
+# Geospatial and medical imaging data
+*.dcm
+*.grib
+*.grib2
+*.nii
+*.nii.gz
+*.tif
+*.tiff
+
+# Large media and figure sources
+*.ai
+*.avi
+*.flac
+*.mkv
+*.mov
+*.mp4
+*.pdf
+*.psd
+*.wav
+
+# Presentations and generated documents
+*.key
+*.odp
+*.ppt
+*.pptx
+
+# Logs and temporary outputs
+*.log
+*.tmp
